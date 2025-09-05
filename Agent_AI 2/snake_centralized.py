@@ -1,10 +1,5 @@
 # snake_centralized.py
-# - 빨간 먹이 여러 개를 무작위로 "고정" 배치
-# - 각 지렁이는 헤드 기준 3x3(주변 1칸) 로컬 관측을 중앙에 전달
-# - 중앙 컨트롤러가 각 지렁이 액션을 결정
-# - 먹이를 먹으면 몸 길이 +1
-# - single: 2마리 + 중앙1개 / multi: 4마리 + 중앙2개(각각 2마리 담당)
-# 실행 예: python snake_centralized.py --mode multi --render
+# 중앙집중 제어 + 흡수 규칙(머리가 다른 지렁이의 몸에 닿으면 몸 쪽이 상대 전체 길이 흡수)
 
 import argparse, random
 from collections import deque
@@ -52,7 +47,7 @@ class MultiSnakeEnv:
             self.snakes.append({
                 "body": body,           # deque of (x,y)
                 "dir": direction,       # (dx,dy)
-                "grow": 0,              # 성장 대기칸
+                "grow": 0,              # 성장 대기칸(양수면 그만큼 꼬리를 안 줄임)
                 "color_head": (40,240,140) if i%2==0 else (90,120,255),
                 "color_body": (80,200,120) if i%2==0 else (120,150,240)
             })
@@ -90,11 +85,9 @@ class MultiSnakeEnv:
                     patch[iy,ix,0] = 1.0  # 벽
                 if (x,y) in self.food:
                     patch[iy,ix,1] = 1.0  # 먹이
-        # 평탄화하여 반환(길이 18)
-        return patch.reshape(-1)
+        return patch.reshape(-1)  # 길이 18
 
     def _get_local_obs_all(self):
-        # 각 지렁이 헤드의 로컬 관측
         obs = []
         for i,s in enumerate(self.snakes):
             head = s["body"][0]
@@ -105,15 +98,16 @@ class MultiSnakeEnv:
         # actions: 길이 num_snakes, 각 액션 인덱스(0~4)
         self.t += 1
 
-        # 먼저 방향 갱신(STAY는 유지)
+        # 1) 방향 갱신(STAY는 유지)
         for i, act in enumerate(actions):
             if not self.alive[i]: continue
             d = ACTIONS[act]
             if d != (0,0):
                 self.snakes[i]["dir"] = d
 
-        # 이동 결과 미리 계산
+        # 2) 이동 결과(새 머리 위치) 미리 계산
         new_heads = []
+        pre_len = [len(s["body"]) for s in self.snakes]  # 흡수 길이 계산에 사용
         for i,s in enumerate(self.snakes):
             if not self.alive[i]:
                 new_heads.append(None)
@@ -122,50 +116,111 @@ class MultiSnakeEnv:
             dx, dy = s["dir"]
             new_heads.append((hx+dx, hy+dy))
 
-        # 충돌 판정(벽/머리-머리)
-        # 몸통 점유(이동 전 상태 기준)
-        body_occ = set()
+        # 3) 충돌 판정용 몸통 점유(이동 전 기준, 머리 제외)
+        body_occ_by_snake = []
+        all_body_occ = set()
         for s in self.snakes:
-            for p in list(s["body"])[1:]:  # 머리 제외
-                body_occ.add(p)
+            body_ex_head = set(list(s["body"])[1:])
+            body_occ_by_snake.append(body_ex_head)
+            all_body_occ |= body_ex_head
 
+        # 4) 사망/흡수 이벤트 판정
         dead = [False]*self.num_snakes
-        # 벽/몸통/상호 머리충돌
+        capture_events = []  # (attacker_i, victim_j)
+        # (a) 벽 충돌, (b) 자기/상대 몸통 충돌(흡수 후보), (c) 머리-머리 충돌
         for i,nh in enumerate(new_heads):
-            if not self.alive[i]: continue
+            if not self.alive[i]: 
+                continue
+            # 벽
             if nh is None or not self._in_bounds(nh):
                 dead[i] = True
                 continue
-            if nh in body_occ:
-                dead[i] = True
-        # 머리끼리 같은 칸으로 이동하는 경우
+            # 머리-머리 충돌은 나중에 일괄 처리
+        # 머리-머리
         for i in range(self.num_snakes):
-            if not self.alive[i]: continue
+            if not self.alive[i] or dead[i]: continue
             for j in range(i+1,self.num_snakes):
-                if not self.alive[j]: continue
+                if not self.alive[j] or dead[j]: continue
                 if new_heads[i] == new_heads[j]:
                     dead[i] = True; dead[j] = True
 
-        # 실제 이동/성장/먹이 처리
+        # 몸통 충돌(흡수 룰): 자기 몸은 제외하고, 다른 지렁이 몸에 닿은 경우만 흡수
+        for i,nh in enumerate(new_heads):
+            if not self.alive[i] or dead[i]: 
+                continue
+            # 이미 머리-머리로 죽었으면 처리하지 않음
+            hit_any = False
+            for j in range(self.num_snakes):
+                if i == j: 
+                    continue
+                if nh in body_occ_by_snake[j]:
+                    # i의 머리가 j의 몸통에 닿았다 → j가 i를 흡수
+                    capture_events.append((i, j))
+                    hit_any = True
+                    break
+            # 벽/몸 충돌로 죽음 플래그는 아직 두지 않음(흡수 우선 규칙 적용을 위해)
+            # 흡수 이벤트가 있으면 i는 이동하지 않고 제거될 예정
+
+        # 5) 흡수 처리: 피해자(victim)가 가해자(attacker)의 전체 길이 흡수
+        #    동시에 여러 건 발생할 수 있으므로 피해자별 총 흡수량을 합산
+        absorb_add = [0]*self.num_snakes
+        attackers_to_kill = set()
+        for atk, vic in capture_events:
+            if not self.alive[atk] or not self.alive[vic]:
+                continue
+            if dead[atk]:  # 머리-머리 등으로 이미 죽었으면 흡수 안 함
+                continue
+            gain = pre_len[atk]
+            absorb_add[vic] += gain
+            attackers_to_kill.add(atk)
+
+        # 6) 실제 이동/먹이/성장/사망 적용
+        #    규칙:
+        #     - 흡수된 공격자(attacker)는 즉시 제거(이동하지 않음)
+        #     - 피해자(victim)는 grow에 길이 추가
+        #     - 나머지 일반 이동 후, 먹이 먹으면 grow+1
         for i,s in enumerate(self.snakes):
-            if not self.alive[i]: continue
-            if dead[i]:
+            if not self.alive[i]:
+                continue
+
+            # 공격자로 지정되었거나 벽/머리-머리로 죽음이면 제거
+            if i in attackers_to_kill or dead[i]:
                 self.alive[i] = False
                 continue
+
             nh = new_heads[i]
+            # 정상 이동
             s["body"].appendleft(nh)
+
+            # 먹이 처리
             ate = False
             if nh in self.food:
                 ate = True
                 self.food.remove(nh)
             if ate:
-                s["grow"] += 1  # 길이 +1
-            if s["grow"] > 0:
-                s["grow"] -= 1  # 꼬리 유지(=성장)
-            else:
-                s["body"].pop() # 성장 없으면 꼬리 제거
+                s["grow"] += 1
 
+            # 흡수로 인한 성장 추가
+            if absorb_add[i] > 0:
+                s["grow"] += absorb_add[i]
+
+            # 성장량이 있으면 꼬리 유지(=길이 증가), 없으면 꼬리 제거
+            if s["grow"] > 0:
+                s["grow"] -= 1
+            else:
+                s["body"].pop()
+
+        # 7) 종료 판단
         done = self.t >= self.T or all(a==False for a in self.alive)
+
+        # 8) 먹이가 너무 줄었으면 다시 보충(옵션)
+        if len(self.food) < self.food_target//2:
+            occupied = self._occupied_set()
+            while len(self.food) < self.food_target:
+                p = (self.rng.randint(0,self.N-1), self.rng.randint(0,self.N-1))
+                if p not in occupied:
+                    self.food.add(p)
+
         obs = self._get_local_obs_all()
         return obs, done
 
@@ -186,37 +241,32 @@ class CentralController:
 
     def decide(self, env: MultiSnakeEnv, obs_list):
         actions = {}
-        # 도우미: 먹이 있는 방향 찾기(3x3에서)
+        # 먹이 있는 방향(3x3) 탐색
         def greedy_from_patch(patch18):
             patch = patch18.reshape(3,3,2)
-            # 중앙 기준 인덱스(1,1). 먹이 채널=1
-            # 우선순위: 상/우/하/좌
+            # 중앙(1,1). 먹이 채널=1
             dirs = [(0,-1),(1,0),(0,1),(-1,0)]
-            idxs = [(1,0),(2,1),(1,2),(0,1)]  # 3x3 인덱스
+            idxs = [(1,0),(2,1),(1,2),(0,1)]  # 위/오/아래/왼
             for d,(ix,iy) in zip([UP,RIGHT,DOWN,LEFT], idxs):
-                if patch[iy,ix,1] > 0.5 and patch[iy,ix,0] < 0.5:  # 먹이 있고 벽 아님
+                if patch[iy,ix,1] > 0.5 and patch[iy,ix,0] < 0.5:
                     return d
             return None
 
-        # 안전한 대체 방향
         def safe_fallback(head, current_dir):
-            # 현재 방향이 안전하면 유지
             dx,dy = current_dir
             cand = [ (UP,(0,-1)), (RIGHT,(1,0)), (DOWN,(0,1)), (LEFT,(-1,0)) ]
-            # 현재 방향을 우선
+            # 현재 방향 우선
             ordered = []
             for name,vec in cand:
                 if vec == current_dir:
                     ordered = [(name,vec)] + [x for x in cand if x!=(name,vec)]
                     break
             if not ordered: ordered = cand
+            body_occ = env._occupied_set()
             for name,vec in ordered:
                 nx,ny = head[0]+vec[0], head[1]+vec[1]
-                if 0 <= nx < env.N and 0 <= ny < env.N:
-                    # 다음 칸이 다른 몸통이면 피함(대충)
-                    body_occ = env._occupied_set()
-                    if (nx,ny) not in body_occ:
-                        return name
+                if 0 <= nx < env.N and 0 <= ny < env.N and (nx,ny) not in body_occ:
+                    return name
             return STAY
 
         for sid in self.ids:
@@ -237,7 +287,6 @@ class CentralController:
                 elif (dx,dy)==(1,0):  prefer = RIGHT
                 elif (dx,dy)==(0,1):  prefer = DOWN
                 elif (dx,dy)==(-1,0): prefer = LEFT
-                # 유지가 불가하면 대체 방향
                 if prefer is not None:
                     nx,ny = head[0]+ACTIONS[prefer][0], head[1]+ACTIONS[prefer][1]
                     if 0 <= nx < env.N and 0 <= ny < env.N and (nx,ny) not in env._occupied_set():
@@ -326,4 +375,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
